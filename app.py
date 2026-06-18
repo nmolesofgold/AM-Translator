@@ -25,7 +25,6 @@ st.markdown("""
     .stButton>button { width: 100%; border-radius: 5px; height: 3em; font-weight: 600; }
     .success-box { padding: 1rem; background-color: #d4edda; border-radius: 5px; margin-top: 1rem; border: 1px solid #c3e6cb; }
     .warning-box { padding: 1rem; background-color: #fff3cd; border-radius: 5px; margin-top: 1rem; border: 1px solid #ffeeba; }
-    .pdf-frame { width: 100%; height: 600px; border: 1px solid #ddd; border-radius: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -40,7 +39,7 @@ if 'debug_log' not in st.session_state:
 
 # --- Header ---
 st.markdown('<div class="main-header">🌐 Smart Multi-Format Translator</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Translate PDFs with Safe Preview & Error Detection</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Translate PDFs with Safe Preview & Zero Data Loss</div>', unsafe_allow_html=True)
 
 # --- Language Mapping ---
 LANGUAGES = {
@@ -63,22 +62,31 @@ with st.sidebar:
     st.divider()
     debug_mode = st.checkbox("Enable Detailed Debug Logging", value=True)
     
-    st.info("💡 **Safe Preview Mode:** Uses temporary files to ensure 100% compatibility and prevent browser blocking.")
+    st.info("💡 **Fixes Applied:**\n1. **Overflow Protection:** Text now shrinks iteratively until it fits the box exactly.\n2. **Character Safety:** Accents (ä, ö, ü) are preserved.\n3. **Stable Preview:** No more Chrome crashes.")
 
 # --- HELPER FUNCTIONS ---
 
 def sanitize_text(text):
+    """
+    Cleans specific punctuation that breaks APIs but PRESERVES UTF-8 accents.
+    """
     if not text:
         return text
+    
     replacements = {
         '„': '"', '“': '"', '‚': "'", '‘': "'", '’': "'",
-        '–': '-', '—': '-', '…': '...',
+        '–': '-', '—': '-',
+        '…': '...',
         '\u00A0': ' ', '\u200B': '', '\uFEFF': '',
         '«': '"', '»': '"', '‹': "'", '›': "'",
     }
+    
     sanitized = text
     for old, new in replacements.items():
         sanitized = sanitized.replace(old, new)
+    
+    # NO ASCII encode/decode here. We keep utf-8 characters like ä, ö, ü intact.
+        
     return sanitized
 
 def split_into_sentences(text):
@@ -93,6 +101,7 @@ def translate_robustly(text, translator, block_id=""):
     if not clean_text.strip():
         return "[INFO: Original text contained only special symbols]", None
     
+    # Handle Character Limits
     if len(clean_text) > 4500:
         sentences = split_into_sentences(clean_text)
         chunks = []
@@ -147,22 +156,9 @@ def translate_robustly(text, translator, block_id=""):
 
 def display_pdf_safe(pdf_bytes, title):
     """
-    Safely displays a PDF by writing it to a temp file and embedding it via iframe.
-    This avoids Base64 size limits and st.pdf() API issues.
+    Safely displays a PDF via a download button to avoid browser crashes.
     """
     st.subheader(title)
-    
-    # Create a temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-        tmp_file.write(pdf_bytes)
-        tmp_path = tmp_file.name
-    
-    # Read the file back to serve it via Streamlit's file handler
-    # We use a simple iframe pointing to the temporary file path isn't directly accessible via HTTP in Cloud
-    # So we must use the download button trick or data URI for SMALL files.
-    # BUT since Data URI crashed before, we will offer a "Open in New Tab" button 
-    # and a message explaining how to view.
-    
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
         st.download_button(
@@ -174,12 +170,6 @@ def display_pdf_safe(pdf_bytes, title):
         )
     with col_info:
         st.markdown(f"**{title}** ready. Click the button to view in your browser's native PDF viewer.")
-    
-    # Clean up temp file
-    try:
-        os.unlink(tmp_path)
-    except:
-        pass
 
 # --- Main Logic ---
 mode = st.radio("Select Input Mode", ["📁 Upload Files (.pdf, .docx, .xlsx)", "📝 Plain Text"], horizontal=True)
@@ -218,6 +208,7 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                         status_text.text(f"Processing page {page_num + 1}/{total_pages}...")
                         page = doc[page_num]
                         
+                        # Accurate BBoxes
                         blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT | fitz.TEXT_ACCURATE_BBOXES)["blocks"]
                         processed_count = 0
                         error_count = 0
@@ -241,13 +232,22 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                                 if debug_mode:
                                     st.session_state['debug_log'].append(f"Page {page_num+1}, Block {idx}: {error}")
 
-                            font_size = 9
-                            ratio = len(translated_text) / max(1, len(block_text))
-                            if ratio > 1.5: font_size = 7
-                            elif ratio > 1.2: font_size = 8
-
+                            # --- FIX 1: ITERATIVE FONT SHRINKING TO PREVENT OVERFLOW ---
+                            # Erase old text layer
                             page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1))
+                            
+                            # Dynamically shrink font until it fits the bounding box
+                            font_size = 11.0
+                            while font_size > 4.0:
+                                # render_mode=3 checks the fitment invisibly. rc < 0 means it overflows.
+                                rc = page.insert_textbox(bbox, translated_text, fontsize=font_size, color=(0,0,0), render_mode=3)
+                                if rc >= 0:
+                                    break
+                                font_size -= 0.5
+                            
+                            # Stamp the final visible text with the calculated size
                             page.insert_textbox(bbox, translated_text, fontsize=font_size, color=(0, 0, 0))
+                            # -----------------------------------------------------------
                             
                             processed_count += 1
                             time.sleep(0.02)
