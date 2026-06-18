@@ -63,7 +63,7 @@ with st.sidebar:
     st.divider()
     debug_mode = st.checkbox("Enable Detailed Debug Logging", value=True)
     
-    st.info("✅ **Unicode Fix Applied:** Special characters like „, ", –, … are now preserved and passed directly to the translator. No more '?' replacements.")
+    st.info("done")
 
 # --- HELPER FUNCTIONS ---
 
