@@ -1,21 +1,14 @@
 import streamlit as st
 import fitz  # PyMuPDF
 from deep_translator import GoogleTranslator
-from docx import Document
-import openpyxl
 import io
 import time
 import re
 
 # --- Page Configuration ---
-st.set_page_config(
-    page_title="PDF & Text Translator",
-    page_icon="🌐",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+st.set_page_config(page_title="PDF Translator", page_icon="🌐", layout="wide")
 
-# --- Session State Management ---
+# --- Session State ---
 if 'processed_output_data' not in st.session_state:
     st.session_state['processed_output_data'] = None
     st.session_state['processed_output_name'] = ""
@@ -23,213 +16,149 @@ if 'text_input' not in st.session_state:
     st.session_state['text_input'] = ""
 if 'translated_text_result' not in st.session_state:
     st.session_state['translated_text_result'] = ""
-if 'debug_log' not in st.session_state:
-    st.session_state['debug_log'] = []
 
 # --- Header ---
-st.title("🌐 Universal Document Translator")
-
-# --- Language Mapping ---
-LANGUAGES = {
-    "Auto Detect": "auto", "German": "de", "English": "en", "Spanish": "es",
-    "French": "fr", "Italian": "it", "Portuguese": "pt", "Chinese (Simplified)": "zh-CN",
-    "Japanese": "ja", "Korean": "ko", "Russian": "ru", "Arabic": "ar", "Hindi": "hi",
-    "Dutch": "nl", "Polish": "pl", "Turkish": "tr", "Swedish": "sv"
-}
+st.title("🌐 Professional PDF Translator")
 
 # --- Sidebar ---
 with st.sidebar:
     st.header("Settings")
+    LANGUAGES = {
+        "Auto Detect": "auto", "German": "de", "English": "en", "Spanish": "es",
+        "French": "fr", "Italian": "it", "Portuguese": "pt", "Chinese (Simplified)": "zh-CN",
+        "Japanese": "ja", "Korean": "ko", "Russian": "ru", "Arabic": "ar", "Hindi": "hi"
+    }
+    src_code = st.selectbox("Source", options=list(LANGUAGES.values()), index=0)
+    tgt_code = st.selectbox("Target", options=list(LANGUAGES.values()), index=2)
     
-    source_language = st.selectbox("Source Language", options=list(LANGUAGES.keys()), index=0)
-    target_language = st.selectbox("Target Language", options=list(LANGUAGES.keys()), index=2)
+    # Map values back to keys if needed, but API uses codes directly
+    # Note: selectbox returns the value if we pass values, but let's be explicit
+    # Actually, simpler to just use the codes directly in the dict values above.
     
-    src_code = LANGUAGES[source_language]
-    tgt_code = LANGUAGES[target_language]
-    
-    st.divider()
-    debug_mode = st.checkbox("Enable Error Logging", value=False)
+    debug_mode = st.checkbox("Show Debug Logs", value=False)
 
 # --- Helper Functions ---
 
 def sanitize_text(text):
-    if not text:
-        return text
-    replacements = {
-        '\u00A0': ' ', '\u200B': '', '\uFEFF': '', '\u200C': '', '\u200D': '',
-    }
-    sanitized = text
+    if not text: return text
+    # Only remove invisible control chars, keep visible punctuation like quotes/dashes
+    replacements = {'\u00A0': ' ', '\u200B': '', '\uFEFF': '', '\u200C': '', '\u200D': ''}
     for old, new in replacements.items():
-        sanitized = sanitized.replace(old, new)
-    return sanitized
+        text = text.replace(old, new)
+    return text
 
-def split_into_sentences(text):
-    sentences = re.split(r'(?<=[.!?])\s+|\n', text)
-    return [s.strip() for s in sentences if s.strip()]
-
-def translate_robustly(text, translator, block_id=""):
-    if not text or not text.strip():
-        return text, None
-    
+def translate_robustly(text, translator):
+    if not text or not text.strip(): return text, None
     clean_text = sanitize_text(text)
-    if not clean_text.strip():
-        return "[INFO: Text contained only control characters]", None
-    
     if len(clean_text) > 4500:
-        sentences = split_into_sentences(clean_text)
-        chunks = []
-        current_chunk = ""
-        translated_chunks = []
-        
-        for sent in sentences:
-            if len(current_chunk) + len(sent) < 4000:
-                current_chunk += sent + " "
-            else:
-                chunks.append(current_chunk)
-                current_chunk = sent + " "
-        if current_chunk:
-            chunks.append(current_chunk)
-            
-        for chunk in chunks:
-            try:
-                translated_chunks.append(translator.translate(chunk))
-                time.sleep(0.15)
-            except Exception:
-                translated_chunks.append(f"[ERROR: Chunk too complex]")
-        return " ".join(translated_chunks), None
-
-    try:
-        result = translator.translate(clean_text)
-        return result, None
-    except Exception:
-        pass
-    
-    sentences = split_into_sentences(text)
-    translated_parts = []
-    errors_found = []
-    
-    for i, sentence in enumerate(sentences):
-        clean_sentence = sanitize_text(sentence)
-        if not clean_sentence.strip():
-            continue
+        # Simple chunking for very large blocks
         try:
-            translated = translator.translate(clean_sentence)
-            translated_parts.append(translated)
-            time.sleep(0.15)
-        except Exception as se:
-            err_str = f"[ERROR: Sentence {i+1} failed]"
-            translated_parts.append(err_str)
-            errors_found.append(f"Sentence '{sentence[:30]}...': {str(se)[:50]}")
-            
-    final_text = " ".join(translated_parts)
-    if errors_found and len(errors_found) > len(sentences) * 0.5:
-        final_text = f"[WARNING: Multiple translation errors] {final_text}"
-        
-    return final_text, ", ".join(errors_found) if errors_found else None
+            return translator.translate(clean_text[:4500]), None
+        except: return "[Error: Text too long]", None
+    
+    try:
+        return translator.translate(clean_text), None
+    except Exception as e:
+        # Fallback: split by sentence
+        sentences = re.split(r'(?<=[.!?])\s+', clean_text)
+        result = []
+        for s in sentences:
+            if s.strip():
+                try:
+                    result.append(translator.translate(s))
+                    time.sleep(0.1)
+                except:
+                    result.append(s) # Keep original if fails
+        return " ".join(result), "Partial Failure"
 
 def instant_translate():
-    input_text = st.session_state['text_input']
-    if not input_text.strip():
+    txt = st.session_state['text_input']
+    if not txt.strip():
         st.session_state['translated_text_result'] = ""
         return
-    
     try:
         translator = GoogleTranslator(source=src_code, target=tgt_code)
-        result, _ = translate_robustly(input_text, translator)
-        st.session_state['translated_text_result'] = result
+        res, _ = translate_robustly(txt, translator)
+        st.session_state['translated_text_result'] = res
     except Exception as e:
-        st.session_state['translated_text_result'] = f"Error: {str(e)}"
+        st.session_state['translated_text_result'] = f"Error: {e}"
 
 # --- Main Logic ---
-mode = st.radio("Select Mode", ["Upload Files", "Plain Text"], horizontal=True)
+mode = st.radio("Mode", ["Upload PDF", "Plain Text"], horizontal=True)
 
-if mode == "Upload Files":
-    st.subheader("Upload PDF, Word, or Excel File")
-    uploaded_file = st.file_uploader("Choose a file", type=["pdf", "docx", "xlsx"], label_visibility="collapsed")
-
+if mode == "Upload PDF":
+    uploaded_file = st.file_uploader("Choose PDF", type="pdf")
+    
     if uploaded_file:
-        st.success(f"Loaded: **{uploaded_file.name}**")
-        
-        if st.button("Process & Translate", type="primary"):
+        if st.button("Translate PDF", type="primary"):
             try:
-                st.session_state['debug_log'] = []
-                st.session_state['processed_output_data'] = None
-                
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                original_data = uploaded_file.read()
-                file_ext = uploaded_file.name.split(".")[-1].lower()
-                
-                if file_ext != "pdf":
-                    st.error("Only PDF layout translation is supported in this version. Please use Plain Text mode for other formats or convert to PDF first.")
-                    st.stop()
-
-                doc = fitz.open(stream=original_data, filetype="pdf")
-                total_pages = len(doc)
+                pdf_bytes = uploaded_file.read()
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                 translator = GoogleTranslator(source=src_code, target=tgt_code)
                 
-                for page_num in range(total_pages):
-                    status_text.text(f"Processing page {page_num + 1}/{total_pages}...")
-                    page = doc[page_num]
-                    
+                progress_bar = st.progress(0)
+                
+                for i, page in enumerate(doc):
+                    # Get blocks with accurate boxes
                     blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT | fitz.TEXT_ACCURATE_BBOXES)["blocks"]
-                    processed_count = 0
-
-                    for idx, block in enumerate(blocks):
+                    
+                    for b_idx, block in enumerate(blocks):
                         if "lines" not in block: continue
                         
-                        block_text = " ".join(
-                            span["text"].strip() 
-                            for line in block["lines"] 
-                            for span in line["spans"] 
-                            if span["text"].strip()
-                        )
-                        if not block_text: continue
-
-                        bbox = fitz.Rect(block["bbox"])
-                        translated_text, error = translate_robustly(block_text, translator, block_id=f"P{page_num}-B{idx}")
+                        # --- FIX 1: Better Text Extraction (Preserve Lists) ---
+                        block_text_parts = []
+                        for line in block["lines"]:
+                            line_text = ""
+                            for span in line["spans"]:
+                                line_text += span["text"]
+                            if line_text.strip():
+                                block_text_parts.append(line_text.strip())
                         
-                        if error and debug_mode:
-                            st.session_state['debug_log'].append(f"Page {page_num+1}, Block {idx}: {error}")
-
-                        # Erase and Redraw with Auto-Fit
-                        page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1))
-                        font_size = 11.0
-                        while font_size > 4.0:
-                            rc = page.insert_textbox(bbox, translated_text, fontsize=font_size, color=(0,0,0), render_mode=3)
-                            if rc >= 0:
+                        block_text = "\n".join(block_text_parts) # Preserve internal newlines
+                        
+                        if not block_text.strip(): continue
+                        
+                        bbox = fitz.Rect(block["bbox"])
+                        
+                        # Translate
+                        trans_text, err = translate_robustly(block_text, translator)
+                        if err and debug_mode:
+                            st.warning(f"Page {i+1}: {err}")
+                        
+                        # --- FIX 2: Double-Cover Erase to prevent Ghosting ---
+                        # Expand the box slightly by 2 points in all directions to ensure full coverage
+                        erase_bbox = bbox + (-2, -2, 2, 2) 
+                        page.draw_rect(erase_bbox, color=(1, 1, 1), fill=(1, 1, 1))
+                        
+                        # --- FIX 3: Smart Font Sizing & Insertion ---
+                        font_size = 10.0
+                        # Check fitment
+                        while font_size > 5.0:
+                            # render_mode=3 checks fit without drawing
+                            rc = page.insert_textbox(bbox, trans_text, fontsize=font_size, color=(0,0,0), render_mode=3)
+                            if rc >= 0: # Fits!
                                 break
                             font_size -= 0.5
-                        page.insert_textbox(bbox, translated_text, fontsize=font_size, color=(0, 0, 0))
                         
-                        processed_count += 1
-                        time.sleep(0.02)
+                        # Final Draw
+                        page.insert_textbox(bbox, trans_text, fontsize=font_size, color=(0, 0, 0))
                     
-                    progress_bar.progress((page_num + 1) / total_pages)
-
-                output_buffer = io.BytesIO()
-                doc.save(output_buffer)
+                    progress_bar.progress((i + 1) / len(doc))
+                
+                # Save
+                out_buf = io.BytesIO()
+                doc.save(out_buf)
                 doc.close()
                 
-                st.session_state['processed_output_data'] = output_buffer.getvalue()
+                st.session_state['processed_output_data'] = out_buf.getvalue()
                 st.session_state['processed_output_name'] = f"translated_{uploaded_file.name}"
-                
                 st.balloons()
-                st.success("Translation Complete!")
+                st.success("Done!")
                 
-                if debug_mode and st.session_state['debug_log']:
-                    with st.expander("View Error Log"):
-                        for log in st.session_state['debug_log']:
-                            st.code(log)
-
             except Exception as e:
-                st.error(f"Error: {str(e)}")
-    
-    # Result Section (Only appears after processing)
+                st.error(f"Critical Error: {e}")
+
     if st.session_state['processed_output_data']:
-        st.divider()
-        st.subheader("Download Result")
         st.download_button(
             label="📥 Download Translated PDF",
             data=st.session_state['processed_output_data'],
@@ -239,29 +168,12 @@ if mode == "Upload Files":
         )
 
 elif mode == "Plain Text":
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        st.subheader("Input")
-        st.text_area(
-            "Paste text here", 
-            value=st.session_state['text_input'], 
-            height=400, 
-            placeholder="Type or paste text to translate instantly...", 
-            label_visibility="collapsed",
-            key="text_input",
-            on_change=instant_translate
-        )
-
-    with col2:
-        st.subheader("Translation")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.text_area("Input", key="text_input", height=400, on_change=instant_translate, placeholder="Type here...")
+    with c2:
         if st.session_state['translated_text_result']:
             st.text_area("Output", value=st.session_state['translated_text_result'], height=400, label_visibility="collapsed")
-            st.download_button(
-                "Download .txt", 
-                data=st.session_state['translated_text_result'], 
-                file_name="translated.txt", 
-                mime="text/plain", 
-                use_container_width=True
-            )
+            st.download_button("Download .txt", st.session_state['translated_text_result'], "translated.txt")
         else:
-            st.info("Translation will appear here automatically.")
+            st.info("Translation appears here...")
