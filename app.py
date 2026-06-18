@@ -66,12 +66,15 @@ with st.sidebar:
     
     debug_mode = st.checkbox("Enable Detailed Debug Logging", value=True)
     
-    st.info("💡 **New Features:**\n- **Live PDF Preview**: View original and translated files side-by-side.\n- **Error Injection**: Untranslatable text is marked with `[ERROR: ...]` directly in the PDF.\n- **Chunking**: Large text blocks are automatically split.")
+    st.info("💡 **Updates Applied:**\n- **Accurate BBoxes**: Fixed text skipping via vector tracking.\n- **UTF-8 Safe**: Accented characters (ä, ö, ü, é) are now preserved.\n- **Anti-Ban**: Increased rate-limiting to prevent IP blocks.")
 
 # --- HELPER FUNCTIONS ---
 
 def sanitize_text(text):
-    """Cleans special characters that break APIs."""
+    """
+    Cleans special characters that break APIs while preserving UTF-8 accents.
+    MODIFICATION: Removed ASCII encode/decode to preserve European characters.
+    """
     if not text:
         return text
     
@@ -79,19 +82,19 @@ def sanitize_text(text):
         '„': '"', '“': '"', '‚': "'", '‘': "'", '’': "'",
         '–': '-', '—': '-',
         '…': '...',
-        '\u00A0': ' ', '\u200B': '', '\uFEFF': '',
-        '«': '"', '»': '"', '‹': "'", '›': "'",
+        '\u00A0': ' ',  # Non-breaking space
+        '\u200B': '',   # Zero-width space
+        '\uFEFF': '',   # BOM
+        '«': '"', '»': '"',
+        '‹': "'", '›': "'",
     }
     
     sanitized = text
     for old, new in replacements.items():
         sanitized = sanitized.replace(old, new)
     
-    # Strip non-ASCII to prevent HTTP errors
-    try:
-        sanitized = sanitized.encode('ascii', 'ignore').decode('ascii')
-    except Exception:
-        pass
+    # REMOVED: The ascii encode/decode block that was stripping accents like ä, ö, ü.
+    # deep-translator handles UTF-8 natively.
         
     return sanitized
 
@@ -104,7 +107,6 @@ def translate_robustly(text, translator, block_id=""):
     """
     Translates with error tracking. 
     Returns tuple: (translated_text, error_message_or_None)
-    Injects error messages into the text if translation fails.
     """
     if not text or not text.strip():
         return text, None
@@ -132,7 +134,7 @@ def translate_robustly(text, translator, block_id=""):
         for chunk in chunks:
             try:
                 translated_chunks.append(translator.translate(chunk))
-                time.sleep(0.05)
+                time.sleep(0.15) # Increased delay for large chunks
             except Exception as e:
                 translated_chunks.append(f"[ERROR: Chunk too complex]")
         
@@ -143,7 +145,6 @@ def translate_robustly(text, translator, block_id=""):
         result = translator.translate(clean_text)
         return result, None
     except Exception as e:
-        # Capture error but continue
         pass
     
     # Strategy 2: Sentence-level Fallback
@@ -159,16 +160,15 @@ def translate_robustly(text, translator, block_id=""):
         try:
             translated = translator.translate(clean_sentence)
             translated_parts.append(translated)
-            time.sleep(0.03)
+            # MODIFICATION: Increased sleep from 0.03 to 0.15 to prevent 429 Rate Limit errors
+            time.sleep(0.15) 
         except Exception as se:
-            # INJECT ERROR MESSAGE INTO OUTPUT
             err_str = f"[ERROR: Sentence {i+1} failed]"
             translated_parts.append(err_str)
             errors_found.append(f"Sentence '{sentence[:30]}...': {str(se)[:50]}")
             
     final_text = " ".join(translated_parts)
     
-    # If more than 50% of sentences failed, add a warning prefix
     if errors_found and len(errors_found) > len(sentences) * 0.5:
         final_text = f"[WARNING: Multiple translation errors in this block] {final_text}"
         
@@ -176,7 +176,7 @@ def translate_robustly(text, translator, block_id=""):
     return final_text, error_summary
 
 def embed_pdf_viewer(pdf_bytes, title):
-    """Embeds a PDF viewer using base64 encoding for side-by-side comparison."""
+    """Embeds a PDF viewer using base64 encoding."""
     base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
     pdf_display = f"""
     <iframe src="data:application/pdf;base64,{base64_pdf}" 
@@ -231,7 +231,9 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                         status_text.text(f"Processing page {page_num + 1}/{total_pages}...")
                         page = doc[page_num]
                         
-                        blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)["blocks"]
+                        # MODIFICATION: Added fitz.TEXT_ACCURATE_BBOXES to fix text skipping
+                        blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT | fitz.TEXT_ACCURATE_BBOXES)["blocks"]
+                        
                         processed_count = 0
                         error_count = 0
 
@@ -265,7 +267,7 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                             elif ratio > 1.2:
                                 font_size = 8
 
-                            # Redraw: Erase old, write new (including any injected error messages)
+                            # Redraw
                             page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1))
                             page.insert_textbox(bbox, translated_text, fontsize=font_size, color=(0, 0, 0))
                             
@@ -297,7 +299,7 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
 
                 except Exception as e:
                     st.error(f"❌ Critical System Error: {str(e)}")
-                    st.info("💡 Tip: If this persists, your PDF might be scanned (image-based) rather than text-based.")
+                    st.info("💡 Tip: If this persists, your PDF might be scanned (image-based).")
         else:
             st.info("👆 Upload a file to begin")
             
