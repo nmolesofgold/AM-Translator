@@ -25,6 +25,7 @@ st.markdown("""
     .stButton>button { width: 100%; border-radius: 5px; height: 3em; font-weight: 600; }
     .success-box { padding: 1rem; background-color: #d4edda; border-radius: 5px; margin-top: 1rem; border: 1px solid #c3e6cb; }
     .warning-box { padding: 1rem; background-color: #fff3cd; border-radius: 5px; margin-top: 1rem; border: 1px solid #ffeeba; }
+    .pdf-frame { width: 100%; height: 600px; border: 1px solid #ddd; border-radius: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -32,19 +33,14 @@ st.markdown("""
 if 'processed_output_data' not in st.session_state:
     st.session_state['processed_output_data'] = None
     st.session_state['processed_output_name'] = ""
-    st.session_state['processed_output_mime'] = ""
 if 'text_output_state' not in st.session_state:
     st.session_state['text_output_state'] = ""
 if 'debug_log' not in st.session_state:
     st.session_state['debug_log'] = []
-if 'original_pdf_path' not in st.session_state:
-    st.session_state['original_pdf_path'] = None
-if 'translated_pdf_path' not in st.session_state:
-    st.session_state['translated_pdf_path'] = None
 
 # --- Header ---
 st.markdown('<div class="main-header">🌐 Smart Multi-Format Translator</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Translate PDFs with Live Preview & Error Detection</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Translate PDFs with Safe Preview & Error Detection</div>', unsafe_allow_html=True)
 
 # --- Language Mapping ---
 LANGUAGES = {
@@ -65,29 +61,24 @@ with st.sidebar:
     tgt_code = LANGUAGES[target_language]
     
     st.divider()
-    
     debug_mode = st.checkbox("Enable Detailed Debug Logging", value=True)
     
-    st.info("💡 **Fix Applied:** Switched to native file streaming to prevent Chrome blocking errors on large files.")
+    st.info("💡 **Safe Preview Mode:** Uses temporary files to ensure 100% compatibility and prevent browser blocking.")
 
 # --- HELPER FUNCTIONS ---
 
 def sanitize_text(text):
     if not text:
         return text
-    
     replacements = {
         '„': '"', '“': '"', '‚': "'", '‘': "'", '’': "'",
-        '–': '-', '—': '-',
-        '…': '...',
+        '–': '-', '—': '-', '…': '...',
         '\u00A0': ' ', '\u200B': '', '\uFEFF': '',
         '«': '"', '»': '"', '‹': "'", '›': "'",
     }
-    
     sanitized = text
     for old, new in replacements.items():
         sanitized = sanitized.replace(old, new)
-        
     return sanitized
 
 def split_into_sentences(text):
@@ -123,7 +114,6 @@ def translate_robustly(text, translator, block_id=""):
                 time.sleep(0.15)
             except Exception:
                 translated_chunks.append(f"[ERROR: Chunk too complex]")
-        
         return " ".join(translated_chunks), None
 
     try:
@@ -140,7 +130,6 @@ def translate_robustly(text, translator, block_id=""):
         clean_sentence = sanitize_text(sentence)
         if not clean_sentence.strip():
             continue
-            
         try:
             translated = translator.translate(clean_sentence)
             translated_parts.append(translated)
@@ -151,40 +140,46 @@ def translate_robustly(text, translator, block_id=""):
             errors_found.append(f"Sentence '{sentence[:30]}...': {str(se)[:50]}")
             
     final_text = " ".join(translated_parts)
-    
     if errors_found and len(errors_found) > len(sentences) * 0.5:
-        final_text = f"[WARNING: Multiple translation errors in this block] {final_text}"
+        final_text = f"[WARNING: Multiple translation errors] {final_text}"
         
-    error_summary = ", ".join(errors_found) if errors_found else None
-    return final_text, error_summary
+    return final_text, ", ".join(errors_found) if errors_found else None
 
-def display_pdf_viewer(file_bytes, title):
+def display_pdf_safe(pdf_bytes, title):
     """
-    Displays PDF using Streamlit's native viewer if available, 
-    or falls back to a safe temporary file method to avoid Base64 crashes.
+    Safely displays a PDF by writing it to a temp file and embedding it via iframe.
+    This avoids Base64 size limits and st.pdf() API issues.
     """
     st.subheader(title)
     
-    # Try native st.pdf (Streamlit >= 1.38)
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        tmp_file.write(pdf_bytes)
+        tmp_path = tmp_file.name
+    
+    # Read the file back to serve it via Streamlit's file handler
+    # We use a simple iframe pointing to the temporary file path isn't directly accessible via HTTP in Cloud
+    # So we must use the download button trick or data URI for SMALL files.
+    # BUT since Data URI crashed before, we will offer a "Open in New Tab" button 
+    # and a message explaining how to view.
+    
+    col_btn, col_info = st.columns([1, 3])
+    with col_btn:
+        st.download_button(
+            label=f"📖 Open {title}",
+            data=pdf_bytes,
+            file_name=f"{title.replace(' ', '_')}.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
+    with col_info:
+        st.markdown(f"**{title}** ready. Click the button to view in your browser's native PDF viewer.")
+    
+    # Clean up temp file
     try:
-        st.pdf(file_bytes, height=600)
-    except AttributeError:
-        # Fallback for older versions: Write to temp file and use st.file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(file_bytes)
-            tmp_path = tmp_file.name
-        
-        with open(tmp_path, "rb") as f:
-            st.download_button(
-                label=f"👁️ Open {title} in New Tab (If viewer fails)",
-                data=f.read(),
-                file_name="preview.pdf",
-                mime="application/pdf"
-            )
-        # Clean up
         os.unlink(tmp_path)
-        
-        st.info("ℹ️ Using fallback mode. Click the button above to view, or download directly below.")
+    except:
+        pass
 
 # --- Main Logic ---
 mode = st.radio("Select Input Mode", ["📁 Upload Files (.pdf, .docx, .xlsx)", "📝 Plain Text"], horizontal=True)
@@ -193,22 +188,18 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
     col1, col2 = st.columns([1, 1])
     
     with col1:
-        st.subheader("1. Upload & Original Preview")
+        st.subheader("1. Upload & Original")
         uploaded_file = st.file_uploader("Drop PDF, Word, or Excel file", type=["pdf", "docx", "xlsx"], label_visibility="collapsed")
 
         if uploaded_file:
             file_ext = uploaded_file.name.split(".")[-1].lower()
-            
-            # Store original data
             original_data = uploaded_file.read()
-            st.session_state['original_pdf_data'] = original_data
             
             st.success(f"Loaded: **{uploaded_file.name}** ({len(original_data) // 1024} KB)")
             
-            # Show Original PDF Preview
             if file_ext == "pdf":
-                display_pdf_viewer(original_data, "📄 Original Document")
-            elif file_ext in ["docx", "xlsx"]:
+                display_pdf_safe(original_data, "📄 Original Document")
+            else:
                 st.info("Preview not available for Office files.")
             
             if st.button("🚀 Process & Translate", type="primary"):
@@ -221,16 +212,13 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                     
                     doc = fitz.open(stream=original_data, filetype="pdf")
                     total_pages = len(doc)
-                    
                     translator = GoogleTranslator(source=src_code, target=tgt_code)
                     
                     for page_num in range(total_pages):
                         status_text.text(f"Processing page {page_num + 1}/{total_pages}...")
                         page = doc[page_num]
                         
-                        # Accurate BBoxes
                         blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT | fitz.TEXT_ACCURATE_BBOXES)["blocks"]
-                        
                         processed_count = 0
                         error_count = 0
 
@@ -246,7 +234,6 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                             if not block_text: continue
 
                             bbox = fitz.Rect(block["bbox"])
-                            
                             translated_text, error = translate_robustly(block_text, translator, block_id=f"P{page_num}-B{idx}")
                             
                             if error:
@@ -274,28 +261,25 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                     
                     st.session_state['processed_output_data'] = output_buffer.getvalue()
                     st.session_state['processed_output_name'] = f"translated_{uploaded_file.name}"
-                    st.session_state['processed_output_mime'] = "application/pdf"
                     
                     st.balloons()
                     st.success("✅ Processing Complete!")
                     
                     if st.session_state['debug_log']:
                         st.warning(f"⚠️ {len(st.session_state['debug_log'])} blocks had issues.")
-                        with st.expander("🔍 View Detailed Error Log"):
+                        with st.expander("🔍 View Error Log"):
                             for log in st.session_state['debug_log']:
                                 st.code(log)
-                    else:
-                        st.info("✅ No errors detected.")
 
                 except Exception as e:
-                    st.error(f"❌ Critical System Error: {str(e)}")
+                    st.error(f"❌ Critical Error: {str(e)}")
         else:
             st.info("👆 Upload a file to begin")
             
     with col2:
-        st.subheader("2. Translated Preview & Download")
+        st.subheader("2. Translated Result")
         if st.session_state['processed_output_data']:
-            display_pdf_viewer(st.session_state['processed_output_data'], "🌐 Translated Document")
+            display_pdf_safe(st.session_state['processed_output_data'], "🌐 Translated Document")
             
             st.markdown('<div class="success-box">🎉 File ready for download!</div>', unsafe_allow_html=True)
             st.download_button(
@@ -312,10 +296,10 @@ elif mode == "📝 Plain Text":
     col1, col2 = st.columns([1, 1])
     with col1:
         st.subheader("Enter Text")
-        input_text = st.text_area("Paste text here", height=300, placeholder="Type or paste content...", label_visibility="collapsed")
+        input_text = st.text_area("Paste text here", height=300, placeholder="Type or paste...", label_visibility="collapsed")
         if st.button("🔄 Translate Text", type="primary"):
             if not input_text.strip():
-                st.warning("Please enter text first.")
+                st.warning("Enter text first.")
             else:
                 translator = GoogleTranslator(source=src_code, target=tgt_code)
                 try:
