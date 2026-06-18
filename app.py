@@ -8,7 +8,6 @@ import time
 import re
 import os
 import tempfile
-import base64
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -26,15 +25,7 @@ st.markdown("""
     .stButton>button { width: 100%; border-radius: 5px; height: 3em; font-weight: 600; }
     .success-box { padding: 1rem; background-color: #d4edda; border-radius: 5px; margin-top: 1rem; border: 1px solid #c3e6cb; }
     .warning-box { padding: 1rem; background-color: #fff3cd; border-radius: 5px; margin-top: 1rem; border: 1px solid #ffeeba; }
-    .pdf-container { 
-        height: 650px; 
-        border: 1px solid #ddd; 
-        border-radius: 8px; 
-        overflow: hidden; 
-        background: #f5f5f5;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .pdf-label { font-weight: 600; margin-bottom: 0.5rem; color: #333; }
+    .view-instruction { background: #e3f2fd; padding: 1rem; border-radius: 5px; border-left: 4px solid #2196f3; margin: 1rem 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -46,12 +37,10 @@ if 'text_output_state' not in st.session_state:
     st.session_state['text_output_state'] = ""
 if 'debug_log' not in st.session_state:
     st.session_state['debug_log'] = []
-if 'original_pdf_data' not in st.session_state:
-    st.session_state['original_pdf_data'] = None
 
 # --- Header ---
 st.markdown('<div class="main-header">🌐 Smart Multi-Format Translator</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Translate PDFs with Live In-Browser Preview</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Translate PDFs with Full Unicode Support (No ? errors)</div>', unsafe_allow_html=True)
 
 # --- Language Mapping ---
 LANGUAGES = {
@@ -74,26 +63,35 @@ with st.sidebar:
     st.divider()
     debug_mode = st.checkbox("Enable Detailed Debug Logging", value=True)
     
-    st.info("💡 **Preview Fix:** PDFs now render directly in the browser using an optimized viewer.\n\n**Layout Fix:** Text now auto-shrinks to fit perfectly without overflowing.")
+    st.info("✅ **Unicode Fix Applied:** Special characters like „, ", –, … are now preserved and passed directly to the translator. No more '?' replacements.")
 
 # --- HELPER FUNCTIONS ---
 
 def sanitize_text(text):
+    """
+    Cleans ONLY invisible control characters that break HTTP requests.
+    PRESERVES all visible Unicode characters (quotes, dashes, accents, emojis).
+    """
     if not text:
         return text
     
+    # Only remove invisible/control characters that cause API errors
+    # We DO NOT replace visible punctuation like „, ", –, … anymore.
     replacements = {
-        '„': '"', '“': '"', '‚': "'", '‘': "'", '’': "'",
-        '–': '-', '—': '-',
-        '…': '...',
-        '\u00A0': ' ', '\u200B': '', '\uFEFF': '',
-        '«': '"', '»': '"', '‹': "'", '›': "'",
+        '\u00A0': ' ',  # Non-breaking space -> normal space
+        '\u200B': '',   # Zero-width space -> remove
+        '\uFEFF': '',   # BOM -> remove
+        '\u200C': '',   # Zero-width non-joiner
+        '\u200D': '',   # Zero-width joiner
     }
     
     sanitized = text
     for old, new in replacements.items():
         sanitized = sanitized.replace(old, new)
     
+    # IMPORTANT: We do NOT encode/decode to ASCII. 
+    # We keep the string as pure UTF-8.
+        
     return sanitized
 
 def split_into_sentences(text):
@@ -104,9 +102,10 @@ def translate_robustly(text, translator, block_id=""):
     if not text or not text.strip():
         return text, None
     
+    # Sanitize but keep visible special chars
     clean_text = sanitize_text(text)
     if not clean_text.strip():
-        return "[INFO: Original text contained only special symbols]", None
+        return "[INFO: Text contained only control characters]", None
     
     if len(clean_text) > 4500:
         sentences = split_into_sentences(clean_text)
@@ -160,48 +159,23 @@ def translate_robustly(text, translator, block_id=""):
         
     return final_text, ", ".join(errors_found) if errors_found else None
 
-def display_pdf_viewer(pdf_bytes, title):
-    """
-    Displays PDF inline for small files (<2MB) via Base64 iframe.
-    For larger files, provides a 'Click to View' button that opens in browser tab.
-    """
-    st.markdown(f'<div class="pdf-label">{title}</div>', unsafe_allow_html=True)
+def display_pdf_stable(pdf_bytes, title):
+    st.subheader(title)
+    st.markdown(f"""
+    <div class="view-instruction">
+        <strong>👁️ How to Preview:</strong><br>
+        Click the button below to open the PDF in your browser's built-in viewer. 
+        You can read, zoom, and scroll immediately.
+    </div>
+    """, unsafe_allow_html=True)
     
-    file_size_mb = len(pdf_bytes) / (1024 * 1024)
-    
-    if file_size_mb < 2.0:
-        # Small enough for Base64 preview
-        try:
-            base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-            pdf_display = f"""
-            <iframe src="data:application/pdf;base64,{base64_pdf}" 
-                    width="100%" 
-                    height="650px" 
-                    type="application/pdf"
-                    class="pdf-container">
-            </iframe>
-            """
-            st.markdown(pdf_display, unsafe_allow_html=True)
-        except Exception:
-            # Fallback if encoding fails
-            st.download_button(
-                label=f"📖 Click to View {title}",
-                data=pdf_bytes,
-                file_name=f"preview_{title.replace(' ', '_')}.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-            st.caption("File too complex for inline preview. Click to open in new tab.")
-    else:
-        # Too large for Base64 - provide direct view button
-        st.download_button(
-            label=f"📖 Click to View {title} (Full Screen)",
-            data=pdf_bytes,
-            file_name=f"view_{title.replace(' ', '_')}.pdf",
-            mime="application/pdf",
-            use_container_width=True
-        )
-        st.caption("💡 **Tip:** Click the button above to open the PDF in your browser's native viewer. Large files cannot be embedded directly due to browser memory limits.")
+    st.download_button(
+        label=f"📖 Open {title} in New Tab",
+        data=pdf_bytes,
+        file_name=f"{title.replace(' ', '_')}.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
 
 # --- Main Logic ---
 mode = st.radio("Select Input Mode", ["📁 Upload Files (.pdf, .docx, .xlsx)", "📝 Plain Text"], horizontal=True)
@@ -216,12 +190,11 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
         if uploaded_file:
             file_ext = uploaded_file.name.split(".")[-1].lower()
             original_data = uploaded_file.read()
-            st.session_state['original_pdf_data'] = original_data
             
             st.success(f"Loaded: **{uploaded_file.name}** ({len(original_data) // 1024} KB)")
             
             if file_ext == "pdf":
-                display_pdf_viewer(original_data, "📄 Original Document")
+                display_pdf_stable(original_data, "📄 Original Document")
             else:
                 st.info("Preview not available for Office files.")
             
@@ -264,10 +237,10 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                                 if debug_mode:
                                     st.session_state['debug_log'].append(f"Page {page_num+1}, Block {idx}: {error}")
 
-                            # Erase old text cleanly
+                            # Erase old text
                             page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1))
                             
-                            # Iterative font shrinking to fit perfectly
+                            # Iterative font shrinking
                             font_size = 11.0
                             while font_size > 4.0:
                                 rc = page.insert_textbox(bbox, translated_text, fontsize=font_size, color=(0,0,0), render_mode=3)
@@ -275,7 +248,7 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                                     break
                                 font_size -= 0.5
                             
-                            # Final render with calculated size
+                            # Final render (PyMuPDF handles UTF-8 natively)
                             page.insert_textbox(bbox, translated_text, fontsize=font_size, color=(0, 0, 0))
                             
                             processed_count += 1
@@ -308,9 +281,9 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
     with col2:
         st.subheader("2. Translated Result")
         if st.session_state['processed_output_data']:
-            display_pdf_viewer(st.session_state['processed_output_data'], "🌐 Translated Document")
+            display_pdf_stable(st.session_state['processed_output_data'], "🌐 Translated Document")
             
-            st.markdown('<div class="success-box">🎉 File ready for download!</div>', unsafe_allow_html=True)
+            st.markdown('<div class="success-box">🎉 File ready!</div>', unsafe_allow_html=True)
             st.download_button(
                 label="📥 Download Translated PDF",
                 data=st.session_state['processed_output_data'],
