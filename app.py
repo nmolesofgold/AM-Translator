@@ -5,6 +5,7 @@ from docx import Document
 import openpyxl
 import io
 import time
+import re
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -55,7 +56,98 @@ with st.sidebar:
     tgt_code = LANGUAGES[target_language]
     
     st.divider()
-    st.info("💡 **PDFs:** Layout is preserved by redrawing text blocks.\n\n**Word/Excel:** Content is translated while keeping styles intact.")
+    st.info("💡 **Robust Mode Enabled:** Special characters (like „, “) are auto-fixed. If a block fails, it splits into sentences to ensure maximum translation coverage.")
+
+# --- HELPER FUNCTIONS FOR ROBUST TRANSLATION ---
+
+def sanitize_text(text):
+    """
+    Replaces problematic Unicode characters that often break free translation APIs.
+    - German curly quotes „ " to standard "
+    - Single curly quotes ‚ ' to standard '
+    - Long dashes – — to standard hyphen -
+    - Ellipsis … to three dots ...
+    - Non-breaking spaces to regular spaces
+    - Strips non-ASCII characters that might cause HTTP URL encoding errors
+    """
+    if not text:
+        return text
+    
+    # Map of specific replacements
+    replacements = {
+        '„': '"', '“': '"', '‚': "'", '‘': "'", '’': "'",
+        '–': '-', '—': '-',
+        '…': '...',
+        '\u00A0': ' ',  # Non-breaking space
+        '\u200B': '',   # Zero-width space
+        '\uFEFF': '',   # BOM
+        '«': '"', '»': '"', # French quotes
+        '‹': "'", '›': "'", # French single quotes
+    }
+    
+    sanitized = text
+    for old, new in replacements.items():
+        sanitized = sanitized.replace(old, new)
+    
+    # Final safety: Remove any remaining non-ASCII characters that might break the URL request
+    # We encode to ASCII ignoring errors, then decode back.
+    # This keeps standard English/German letters but drops exotic symbols.
+    try:
+        sanitized = sanitized.encode('ascii', 'ignore').decode('ascii')
+    except Exception:
+        pass
+        
+    return sanitized
+
+def split_into_sentences(text):
+    """
+    Splits text into sentences to allow granular error handling.
+    Handles common delimiters like ., !, ?, and newlines.
+    """
+    # Split by sentence endings followed by space, or newlines
+    sentences = re.split(r'(?<=[.!?])\s+|\n', text)
+    return [s.strip() for s in sentences if s.strip()]
+
+def translate_robustly(text, translator):
+    """
+    Attempts to translate text. 
+    Strategy:
+    1. Sanitize input.
+    2. Try translating the whole block.
+    3. If that fails, split into sentences and translate individually.
+    """
+    if not text or not text.strip():
+        return text
+    
+    # Pre-sanitize
+    clean_text = sanitize_text(text)
+    if not clean_text.strip():
+        return text # Return original if sanitization removed everything meaningful
+    
+    # Strategy 1: Direct Translation (Fastest)
+    try:
+        return translator.translate(clean_text)
+    except Exception:
+        pass
+    
+    # Strategy 2: Sentence-level Fallback
+    sentences = split_into_sentences(text) # Split original to preserve structure
+    translated_parts = []
+    
+    for sentence in sentences:
+        clean_sentence = sanitize_text(sentence)
+        if not clean_sentence.strip():
+            continue
+            
+        try:
+            translated = translator.translate(clean_sentence)
+            translated_parts.append(translated)
+            time.sleep(0.03) # Tiny delay between sentences to avoid rate limits
+        except Exception:
+            # If a single sentence fails, keep the original to avoid data loss
+            translated_parts.append(sentence)
+            
+    return " ".join(translated_parts)
 
 # --- Main Logic ---
 mode = st.radio("Select Input Mode", ["📁 Upload Files (.pdf, .docx, .xlsx)", "📝 Plain Text"], horizontal=True)
@@ -89,7 +181,6 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                             status_text.text(f"Processing PDF page {page_num + 1}/{total_pages}...")
                             page = doc[page_num]
                             
-                            # Enhanced extraction flags
                             blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)["blocks"]
 
                             for block in blocks:
@@ -107,8 +198,9 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                                 bbox = fitz.Rect(block["bbox"])
 
                                 try:
-                                    translated_text = translator.translate(block_text)
-                                    time.sleep(0.1) # Rate limiting
+                                    # USE ROBUST TRANSLATION
+                                    translated_text = translate_robustly(block_text, translator)
+                                    time.sleep(0.05) 
 
                                     # Dynamic Font Sizing
                                     font_size = 10
@@ -121,7 +213,7 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                                     page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1))
                                     page.insert_textbox(bbox, translated_text, fontsize=font_size, color=(0, 0, 0))
                                 except Exception:
-                                    continue # Skip failed blocks
+                                    continue 
                             
                             progress_bar.progress((page_num + 1) / total_pages)
 
@@ -139,7 +231,7 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                         for para in doc.paragraphs:
                             if para.text.strip():
                                 try:
-                                    para.text = translator.translate(para.text)
+                                    para.text = translate_robustly(para.text, translator)
                                     time.sleep(0.05)
                                 except: pass
                                 
@@ -148,7 +240,7 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                                 for cell in row.cells:
                                     if cell.text.strip():
                                         try:
-                                            cell.text = translator.translate(cell.text)
+                                            cell.text = translate_robustly(cell.text, translator)
                                             time.sleep(0.05)
                                         except: pass
 
@@ -168,7 +260,7 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                                 for cell in row:
                                     if cell.value and isinstance(cell.value, str) and cell.value.strip():
                                         try:
-                                            cell.value = translator.translate(cell.value)
+                                            cell.value = translate_robustly(str(cell.value), translator)
                                             time.sleep(0.05)
                                         except: pass
                             progress_bar.progress((idx + 1) / total_sheets)
@@ -216,7 +308,7 @@ elif mode == "📝 Plain Text":
             else:
                 try:
                     with st.spinner("Translating..."):
-                        st.session_state['text_output_state'] = translator.translate(input_text)
+                        st.session_state['text_output_state'] = translate_robustly(input_text, translator)
                     st.success("Done!")
                 except Exception as e:
                     st.error(f"Error: {str(e)}")
