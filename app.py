@@ -6,7 +6,8 @@ import openpyxl
 import io
 import time
 import re
-import base64
+import os
+import tempfile
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -24,7 +25,6 @@ st.markdown("""
     .stButton>button { width: 100%; border-radius: 5px; height: 3em; font-weight: 600; }
     .success-box { padding: 1rem; background-color: #d4edda; border-radius: 5px; margin-top: 1rem; border: 1px solid #c3e6cb; }
     .warning-box { padding: 1rem; background-color: #fff3cd; border-radius: 5px; margin-top: 1rem; border: 1px solid #ffeeba; }
-    .pdf-viewer { height: 600px; border: 1px solid #ddd; border-radius: 5px; background: #f9f9f9; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -37,8 +37,10 @@ if 'text_output_state' not in st.session_state:
     st.session_state['text_output_state'] = ""
 if 'debug_log' not in st.session_state:
     st.session_state['debug_log'] = []
-if 'original_pdf_data' not in st.session_state:
-    st.session_state['original_pdf_data'] = None
+if 'original_pdf_path' not in st.session_state:
+    st.session_state['original_pdf_path'] = None
+if 'translated_pdf_path' not in st.session_state:
+    st.session_state['translated_pdf_path'] = None
 
 # --- Header ---
 st.markdown('<div class="main-header">🌐 Smart Multi-Format Translator</div>', unsafe_allow_html=True)
@@ -66,15 +68,11 @@ with st.sidebar:
     
     debug_mode = st.checkbox("Enable Detailed Debug Logging", value=True)
     
-    st.info("💡 **Updates Applied:**\n- **Accurate BBoxes**: Fixed text skipping via vector tracking.\n- **UTF-8 Safe**: Accented characters (ä, ö, ü, é) are now preserved.\n- **Anti-Ban**: Increased rate-limiting to prevent IP blocks.")
+    st.info("💡 **Fix Applied:** Switched to native file streaming to prevent Chrome blocking errors on large files.")
 
 # --- HELPER FUNCTIONS ---
 
 def sanitize_text(text):
-    """
-    Cleans special characters that break APIs while preserving UTF-8 accents.
-    MODIFICATION: Removed ASCII encode/decode to preserve European characters.
-    """
     if not text:
         return text
     
@@ -82,32 +80,21 @@ def sanitize_text(text):
         '„': '"', '“': '"', '‚': "'", '‘': "'", '’': "'",
         '–': '-', '—': '-',
         '…': '...',
-        '\u00A0': ' ',  # Non-breaking space
-        '\u200B': '',   # Zero-width space
-        '\uFEFF': '',   # BOM
-        '«': '"', '»': '"',
-        '‹': "'", '›': "'",
+        '\u00A0': ' ', '\u200B': '', '\uFEFF': '',
+        '«': '"', '»': '"', '‹': "'", '›': "'",
     }
     
     sanitized = text
     for old, new in replacements.items():
         sanitized = sanitized.replace(old, new)
-    
-    # REMOVED: The ascii encode/decode block that was stripping accents like ä, ö, ü.
-    # deep-translator handles UTF-8 natively.
         
     return sanitized
 
 def split_into_sentences(text):
-    """Splits text by sentence boundaries."""
     sentences = re.split(r'(?<=[.!?])\s+|\n', text)
     return [s.strip() for s in sentences if s.strip()]
 
 def translate_robustly(text, translator, block_id=""):
-    """
-    Translates with error tracking. 
-    Returns tuple: (translated_text, error_message_or_None)
-    """
     if not text or not text.strip():
         return text, None
     
@@ -115,7 +102,6 @@ def translate_robustly(text, translator, block_id=""):
     if not clean_text.strip():
         return "[INFO: Original text contained only special symbols]", None
     
-    # Handle Character Limits (API max is ~5000, we safe-guard at 4500)
     if len(clean_text) > 4500:
         sentences = split_into_sentences(clean_text)
         chunks = []
@@ -134,20 +120,18 @@ def translate_robustly(text, translator, block_id=""):
         for chunk in chunks:
             try:
                 translated_chunks.append(translator.translate(chunk))
-                time.sleep(0.15) # Increased delay for large chunks
-            except Exception as e:
+                time.sleep(0.15)
+            except Exception:
                 translated_chunks.append(f"[ERROR: Chunk too complex]")
         
         return " ".join(translated_chunks), None
 
-    # Strategy 1: Direct Translation
     try:
         result = translator.translate(clean_text)
         return result, None
-    except Exception as e:
+    except Exception:
         pass
     
-    # Strategy 2: Sentence-level Fallback
     sentences = split_into_sentences(text)
     translated_parts = []
     errors_found = []
@@ -160,8 +144,7 @@ def translate_robustly(text, translator, block_id=""):
         try:
             translated = translator.translate(clean_sentence)
             translated_parts.append(translated)
-            # MODIFICATION: Increased sleep from 0.03 to 0.15 to prevent 429 Rate Limit errors
-            time.sleep(0.15) 
+            time.sleep(0.15) # Rate limiting
         except Exception as se:
             err_str = f"[ERROR: Sentence {i+1} failed]"
             translated_parts.append(err_str)
@@ -175,19 +158,33 @@ def translate_robustly(text, translator, block_id=""):
     error_summary = ", ".join(errors_found) if errors_found else None
     return final_text, error_summary
 
-def embed_pdf_viewer(pdf_bytes, title):
-    """Embeds a PDF viewer using base64 encoding."""
-    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-    pdf_display = f"""
-    <iframe src="data:application/pdf;base64,{base64_pdf}" 
-            width="100%" 
-            height="600px" 
-            type="application/pdf"
-            class="pdf-viewer">
-    </iframe>
+def display_pdf_viewer(file_bytes, title):
+    """
+    Displays PDF using Streamlit's native viewer if available, 
+    or falls back to a safe temporary file method to avoid Base64 crashes.
     """
     st.subheader(title)
-    st.markdown(pdf_display, unsafe_allow_html=True)
+    
+    # Try native st.pdf (Streamlit >= 1.38)
+    try:
+        st.pdf(file_bytes, height=600)
+    except AttributeError:
+        # Fallback for older versions: Write to temp file and use st.file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file_bytes)
+            tmp_path = tmp_file.name
+        
+        with open(tmp_path, "rb") as f:
+            st.download_button(
+                label=f"👁️ Open {title} in New Tab (If viewer fails)",
+                data=f.read(),
+                file_name="preview.pdf",
+                mime="application/pdf"
+            )
+        # Clean up
+        os.unlink(tmp_path)
+        
+        st.info("ℹ️ Using fallback mode. Click the button above to view, or download directly below.")
 
 # --- Main Logic ---
 mode = st.radio("Select Input Mode", ["📁 Upload Files (.pdf, .docx, .xlsx)", "📝 Plain Text"], horizontal=True)
@@ -202,27 +199,27 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
         if uploaded_file:
             file_ext = uploaded_file.name.split(".")[-1].lower()
             
-            # Store original data immediately for preview
-            st.session_state['original_pdf_data'] = uploaded_file.read()
+            # Store original data
+            original_data = uploaded_file.read()
+            st.session_state['original_pdf_data'] = original_data
             
-            st.success(f"Loaded: **{uploaded_file.name}** ({len(st.session_state['original_pdf_data'])} bytes)")
+            st.success(f"Loaded: **{uploaded_file.name}** ({len(original_data) // 1024} KB)")
             
             # Show Original PDF Preview
             if file_ext == "pdf":
-                embed_pdf_viewer(st.session_state['original_pdf_data'], "📄 Original Document")
+                display_pdf_viewer(original_data, "📄 Original Document")
             elif file_ext in ["docx", "xlsx"]:
-                st.info("Preview not available for Office files. They will be converted/processed directly.")
+                st.info("Preview not available for Office files.")
             
             if st.button("🚀 Process & Translate", type="primary"):
                 try:
-                    st.session_state['debug_log'] = [] # Reset logs
+                    st.session_state['debug_log'] = []
                     st.session_state['processed_output_data'] = None
                     
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
-                    # Re-read from session state
-                    doc = fitz.open(stream=st.session_state['original_pdf_data'], filetype="pdf")
+                    doc = fitz.open(stream=original_data, filetype="pdf")
                     total_pages = len(doc)
                     
                     translator = GoogleTranslator(source=src_code, target=tgt_code)
@@ -231,7 +228,7 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                         status_text.text(f"Processing page {page_num + 1}/{total_pages}...")
                         page = doc[page_num]
                         
-                        # MODIFICATION: Added fitz.TEXT_ACCURATE_BBOXES to fix text skipping
+                        # Accurate BBoxes
                         blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT | fitz.TEXT_ACCURATE_BBOXES)["blocks"]
                         
                         processed_count = 0
@@ -240,7 +237,6 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                         for idx, block in enumerate(blocks):
                             if "lines" not in block: continue
                             
-                            # Extract text
                             block_text = " ".join(
                                 span["text"].strip() 
                                 for line in block["lines"] 
@@ -251,7 +247,6 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
 
                             bbox = fitz.Rect(block["bbox"])
                             
-                            # Translate with error tracking
                             translated_text, error = translate_robustly(block_text, translator, block_id=f"P{page_num}-B{idx}")
                             
                             if error:
@@ -259,15 +254,11 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                                 if debug_mode:
                                     st.session_state['debug_log'].append(f"Page {page_num+1}, Block {idx}: {error}")
 
-                            # Dynamic Font Sizing
                             font_size = 9
                             ratio = len(translated_text) / max(1, len(block_text))
-                            if ratio > 1.5:
-                                font_size = 7
-                            elif ratio > 1.2:
-                                font_size = 8
+                            if ratio > 1.5: font_size = 7
+                            elif ratio > 1.2: font_size = 8
 
-                            # Redraw
                             page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1))
                             page.insert_textbox(bbox, translated_text, fontsize=font_size, color=(0, 0, 0))
                             
@@ -275,7 +266,7 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                             time.sleep(0.02)
                         
                         progress_bar.progress((page_num + 1) / total_pages)
-                        status_text.text(f"Page {page_num+1}: Processed {processed_count} blocks, {error_count} warnings.")
+                        status_text.text(f"Page {page_num+1}: {processed_count} blocks, {error_count} warnings.")
 
                     output_buffer = io.BytesIO()
                     doc.save(output_buffer)
@@ -288,25 +279,23 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                     st.balloons()
                     st.success("✅ Processing Complete!")
                     
-                    # Show Debug Summary
                     if st.session_state['debug_log']:
-                        st.warning(f"⚠️ {len(st.session_state['debug_log'])} blocks had issues. Errors are injected in the PDF text.")
+                        st.warning(f"⚠️ {len(st.session_state['debug_log'])} blocks had issues.")
                         with st.expander("🔍 View Detailed Error Log"):
                             for log in st.session_state['debug_log']:
                                 st.code(log)
                     else:
-                        st.info("✅ No errors detected during translation.")
+                        st.info("✅ No errors detected.")
 
                 except Exception as e:
                     st.error(f"❌ Critical System Error: {str(e)}")
-                    st.info("💡 Tip: If this persists, your PDF might be scanned (image-based).")
         else:
             st.info("👆 Upload a file to begin")
             
     with col2:
         st.subheader("2. Translated Preview & Download")
         if st.session_state['processed_output_data']:
-            embed_pdf_viewer(st.session_state['processed_output_data'], "🌐 Translated Document")
+            display_pdf_viewer(st.session_state['processed_output_data'], "🌐 Translated Document")
             
             st.markdown('<div class="success-box">🎉 File ready for download!</div>', unsafe_allow_html=True)
             st.download_button(
