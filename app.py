@@ -135,3 +135,106 @@ if mode == "📁 Upload Files (.pdf, .docx, .xlsx)":
                     elif file_ext == "docx":
                         status_text.text("Processing Word Document...")
                         doc = Document(io.BytesIO(uploaded_file.read()))
+                        
+                        for para in doc.paragraphs:
+                            if para.text.strip():
+                                try:
+                                    para.text = translator.translate(para.text)
+                                    time.sleep(0.05)
+                                except: pass
+                                
+                        for table in doc.tables:
+                            for row in table.rows:
+                                for cell in row.cells:
+                                    if cell.text.strip():
+                                        try:
+                                            cell.text = translator.translate(cell.text)
+                                            time.sleep(0.05)
+                                        except: pass
+
+                        output_buffer = io.BytesIO()
+                        doc.save(output_buffer)
+                        st.session_state['processed_output_data'] = output_buffer.getvalue()
+                        st.session_state['processed_output_mime'] = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+                    # --- EXCEL PROCESSING ---
+                    elif file_ext == "xlsx":
+                        status_text.text("Processing Excel Spreadsheet...")
+                        wb = openpyxl.load_workbook(io.BytesIO(uploaded_file.read()))
+                        total_sheets = len(wb.worksheets)
+                        
+                        for idx, sheet in enumerate(wb.worksheets):
+                            for row in sheet.iter_rows():
+                                for cell in row:
+                                    if cell.value and isinstance(cell.value, str) and cell.value.strip():
+                                        try:
+                                            cell.value = translator.translate(cell.value)
+                                            time.sleep(0.05)
+                                        except: pass
+                            progress_bar.progress((idx + 1) / total_sheets)
+
+                        output_buffer = io.BytesIO()
+                        wb.save(output_buffer)
+                        st.session_state['processed_output_data'] = output_buffer.getvalue()
+                        st.session_state['processed_output_mime'] = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+                    status_text.empty()
+                    progress_bar.empty()
+                    
+                    st.session_state['processed_output_name'] = f"translated_{uploaded_file.name}"
+                    st.balloons()
+                    st.success("✅ Processing Complete!")
+
+                except Exception as e:
+                    st.error(f"❌ Critical Error: {str(e)}")
+                    st.info("💡 Tip: Ensure the file is not password protected.")
+        else:
+            st.info("👆 Upload a file to begin")
+            
+    with col2:
+        st.subheader("Download Result")
+        if st.session_state['processed_output_data']:
+            st.markdown('<div class="success-box">🎉 File ready for download!</div>', unsafe_allow_html=True)
+            st.download_button(
+                label="📥 Download Translated File",
+                data=st.session_state['processed_output_data'],
+                file_name=st.session_state['processed_output_name'],
+                mime=st.session_state['processed_output_mime'],
+                use_container_width=True
+            )
+        else:
+            st.info("Translated file will appear here.")
+
+elif mode == "📝 Plain Text":
+    with col1:
+        st.subheader("Enter Text")
+        input_text = st.text_area("Paste text here", height=250, placeholder="Type or paste content...", label_visibility="collapsed")
+
+        if st.button("🔄 Translate Text", type="primary"):
+            if not input_text.strip():
+                st.warning("Please enter text first.")
+            else:
+                try:
+                    with st.spinner("Translating..."):
+                        st.session_state['text_output_state'] = translator.translate(input_text)
+                    st.success("Done!")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+
+    with col2:
+        st.subheader("Result")
+        if st.session_state['text_output_state']:
+            st.text_area("Output", value=st.session_state['text_output_state'], height=250, label_visibility="collapsed")
+            st.download_button(
+                label="📥 Download .txt",
+                data=st.session_state['text_output_state'],
+                file_name="translated_text.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+        else:
+            st.info("Translation appears here.")
+
+# Footer
+st.markdown("---")
+st.markdown("<div style='text-align: center; color: #888; font-size: 0.9rem;'>Powered by Streamlit, PyMuPDF, python-docx & openpyxl</div>", unsafe_allow_html=True)
