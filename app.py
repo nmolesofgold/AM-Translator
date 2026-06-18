@@ -1,7 +1,10 @@
 import io
+import os
 import re
 import time
+import shutil
 import hashlib
+import unicodedata
 
 import streamlit as st
 import fitz  # PyMuPDF
@@ -10,10 +13,6 @@ from docx import Document
 from openpyxl import load_workbook
 from PIL import Image
 import pytesseract
-
-
-# If you are on Windows and Tesseract is not found, uncomment this and update the path:
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
 # -----------------------------
@@ -36,6 +35,7 @@ DEFAULT_SESSION_STATE = {
     "translated_text_result": "",
     "debug_log": [],
     "translation_cache": {},
+    "preserve_formula_tokens": True,
 }
 
 for key, value in DEFAULT_SESSION_STATE.items():
@@ -87,7 +87,7 @@ TARGET_LANGUAGES = {
 
 # Tesseract uses different language codes than Google Translate.
 TESSERACT_LANGUAGES = {
-    "auto": "eng",       # Tesseract does not truly auto-detect language.
+    "auto": "eng",       # Tesseract does not truly auto-detect.
     "en": "eng",
     "de": "deu",
     "es": "spa",
@@ -108,6 +108,45 @@ TESSERACT_LANGUAGES = {
 
 
 # -----------------------------
+# Unicode Font Support
+# -----------------------------
+COMMON_UNICODE_FONTS = [
+    # Streamlit Cloud / Debian / Ubuntu
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+
+    # Noto fonts
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+
+    # macOS fallback
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/Library/Fonts/Arial.ttf",
+
+    # Windows fallback
+    r"C:\Windows\Fonts\arial.ttf",
+    r"C:\Windows\Fonts\segoeui.ttf",
+]
+
+
+def find_unicode_font():
+    for font_path in COMMON_UNICODE_FONTS:
+        if os.path.exists(font_path):
+            return font_path
+    return None
+
+
+UNICODE_FONT_PATH = find_unicode_font()
+CUSTOM_FONT_NAME = "customunicodefont"
+
+
+# -----------------------------
 # Header
 # -----------------------------
 st.title("🌐 Universal Document Translator")
@@ -123,13 +162,13 @@ with st.sidebar:
     source_language = st.selectbox(
         "Source Language",
         options=list(SOURCE_LANGUAGES.keys()),
-        index=0
+        index=0,
     )
 
     target_language = st.selectbox(
         "Target Language",
         options=list(TARGET_LANGUAGES.keys()),
-        index=1  # Default English
+        index=1,  # Default English
     )
 
     src_code = SOURCE_LANGUAGES[source_language]
@@ -139,25 +178,38 @@ with st.sidebar:
 
     debug_mode = st.checkbox("Enable Error Logging", value=False)
 
+    st.subheader("PDF/Text Safety")
+
+    preserve_formula_tokens = st.checkbox(
+        "Preserve formula/scientific tokens",
+        value=True,
+        help=(
+            "Helps prevent translation from damaging tokens like CO₂, H₂O, x², 10⁻³, etc. "
+            "This cannot fix characters that the PDF extractor or OCR already read incorrectly."
+        ),
+    )
+
+    st.session_state["preserve_formula_tokens"] = preserve_formula_tokens
+
     st.subheader("OCR Settings")
 
     enable_ocr = st.checkbox(
         "Enable OCR for scanned PDFs",
         value=True,
-        help="Uses free local Tesseract OCR for image-only/scanned PDF pages."
+        help="Uses free local Tesseract OCR for image-only/scanned PDF pages.",
     )
 
     ocr_output_mode = st.selectbox(
         "OCR Output Mode",
         options=[
             "Append translated OCR pages",
-            "Overlay translated text"
+            "Overlay translated text",
         ],
         index=0,
         help=(
             "Append mode is more reliable. "
-            "Overlay mode tries to place translated OCR text over the scanned page, but layout may not be perfect."
-        )
+            "Overlay mode covers the scanned page with translated text and may not preserve layout."
+        ),
     )
 
     ocr_zoom = st.slider(
@@ -166,23 +218,74 @@ with st.sidebar:
         max_value=4.0,
         value=2.5,
         step=0.5,
-        help="Higher values can improve OCR accuracy but use more memory."
+        help="Higher values can improve OCR accuracy but use more memory.",
     )
 
     if enable_ocr and src_code == "auto":
         st.warning(
             "OCR works best when you choose the real source language instead of Auto Detect. "
-            "Tesseract will default to English OCR for Auto Detect."
+            "For German scanned PDFs, choose Source Language = German."
         )
 
-    st.info(
-        "OCR requires Tesseract to be installed on your computer/server, not just the Python package."
-    )
+    st.divider()
+    st.subheader("Server Status")
+
+    tesseract_path = shutil.which("tesseract")
+
+    if tesseract_path:
+        st.success(f"Tesseract found: {tesseract_path}")
+    else:
+        st.error("Tesseract not found. Check packages.txt and redeploy.")
+
+    if UNICODE_FONT_PATH:
+        st.success(f"Unicode font found: {os.path.basename(UNICODE_FONT_PATH)}")
+    else:
+        st.warning("No Unicode font found. Some characters may become ? in PDFs.")
+
+    if debug_mode and tesseract_path:
+        try:
+            installed_ocr_langs = pytesseract.get_languages(config="")
+            st.caption("OCR languages installed:")
+            st.code(", ".join(installed_ocr_langs))
+        except Exception as exc:
+            st.caption(f"Could not list OCR languages: {exc}")
 
 
 # -----------------------------
-# Helper Functions
+# Text Cleanup / Normalization
 # -----------------------------
+def normalize_ocr_and_pdf_text(text: str) -> str:
+    """
+    Normalize text safely.
+
+    Important:
+    - Uses NFC, not NFKC.
+    - NFKC can convert superscripts/subscripts into regular characters.
+      For example, ² may become 2. We do not want that.
+    """
+    if not text:
+        return ""
+
+    cleaned = unicodedata.normalize("NFC", text)
+
+    replacements = {
+        "\u00A0": " ",  # non-breaking space
+        "``": "“",
+        "''": "”",
+        "´´": "“",
+        "…": "...",
+
+        # Common OCR/PDF confusions. Conservative replacements only.
+        "„ ": "„",
+        " “": " “",
+    }
+
+    for old, new in replacements.items():
+        cleaned = cleaned.replace(old, new)
+
+    return cleaned
+
+
 def sanitize_text(text: str) -> str:
     if not text:
         return ""
@@ -200,11 +303,83 @@ def sanitize_text(text: str) -> str:
     for old, new in replacements.items():
         cleaned = cleaned.replace(old, new)
 
+    # Remove most control characters, but preserve tabs/newlines.
     cleaned = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", cleaned)
+    cleaned = normalize_ocr_and_pdf_text(cleaned)
 
     return cleaned.strip()
 
 
+# -----------------------------
+# Formula / Scientific Token Protection
+# -----------------------------
+SUBSCRIPT_SUPERSCRIPT_CHARS = "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎"
+SUB_SUP_PATTERN = f"[{re.escape(SUBSCRIPT_SUPERSCRIPT_CHARS)}]"
+
+
+def protect_sensitive_tokens(text: str):
+    """
+    Protect tokens that translation engines often damage:
+    - H₂O
+    - CO₂
+    - x²
+    - 10⁻³
+    - H2O / CO2 chemical-ish formulas
+
+    This does not fix text that was extracted incorrectly from the PDF.
+    It only prevents correctly extracted tokens from being translated/mangled.
+    """
+    if not text:
+        return text, {}
+
+    protected = {}
+
+    patterns = [
+        # Any contiguous token containing unicode subscript/superscript chars.
+        rf"\b[\wΑ-Ωα-ωµ°+\-*/=().,]*{SUB_SUP_PATTERN}[\wΑ-Ωα-ωµ°+\-*/=().,]*\b",
+
+        # Chemical-ish formulas with digits, e.g. H2O, CO2, Na2SO4.
+        r"\b(?:[A-Z][a-z]?\d*){1,}[A-Z][a-z]?\d+\b",
+        r"\b(?:[A-Z][a-z]?\d+){1,}(?:[A-Z][a-z]?\d*)*\b",
+    ]
+
+    combined = re.compile("|".join(f"({p})" for p in patterns))
+
+    def replacement(match):
+        token = match.group(0)
+
+        # Avoid protecting pure numbers.
+        if token.isdigit():
+            return token
+
+        placeholder = f"ZXQKEEP{len(protected)}QXZ"
+        protected[placeholder] = token
+        return placeholder
+
+    protected_text = combined.sub(replacement, text)
+
+    return protected_text, protected
+
+
+def restore_sensitive_tokens(text: str, protected: dict):
+    if not text or not protected:
+        return text
+
+    restored = text
+
+    for placeholder, original in protected.items():
+        restored = restored.replace(placeholder, original)
+
+        # Sometimes translators add spaces around placeholder-like strings.
+        spaced = " ".join(list(placeholder))
+        restored = restored.replace(spaced, original)
+
+    return restored
+
+
+# -----------------------------
+# Translation Helpers
+# -----------------------------
 def make_cache_key(text: str, source: str, target: str) -> str:
     digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
     return f"{source}:{target}:{digest}"
@@ -213,8 +388,11 @@ def make_cache_key(text: str, source: str, target: str) -> str:
 def split_text_for_translation(text: str, max_chars: int = 4300) -> list[str]:
     text = sanitize_text(text)
 
+    if not text:
+        return []
+
     if len(text) <= max_chars:
-        return [text] if text else []
+        return [text]
 
     pieces = re.split(r"(\n\s*\n)", text)
 
@@ -275,7 +453,7 @@ def translate_chunk(
     target,
     retries=2,
     sleep_seconds=0.25,
-    debug_context=""
+    debug_context="",
 ):
     chunk = sanitize_text(chunk)
 
@@ -299,6 +477,8 @@ def translate_chunk(
             if translated is None:
                 raise ValueError("Translator returned None.")
 
+            translated = sanitize_text(translated)
+
             st.session_state["translation_cache"][cache_key] = translated
             time.sleep(sleep_seconds)
 
@@ -321,6 +501,11 @@ def translate_text(text, translator, source, target, debug_context=""):
     if not text:
         return ""
 
+    protected = {}
+
+    if st.session_state.get("preserve_formula_tokens", True):
+        text, protected = protect_sensitive_tokens(text)
+
     chunks = split_text_for_translation(text)
 
     translated_chunks = [
@@ -329,12 +514,63 @@ def translate_text(text, translator, source, target, debug_context=""):
             translator,
             source,
             target,
-            debug_context=debug_context
+            debug_context=debug_context,
         )
         for c in chunks
     ]
 
-    return "\n\n".join(translated_chunks)
+    translated = "\n\n".join(translated_chunks)
+    translated = restore_sensitive_tokens(translated, protected)
+    translated = sanitize_text(translated)
+
+    return translated
+
+
+# -----------------------------
+# PDF Font / Text Insertion Helpers
+# -----------------------------
+def page_insert_textbox_unicode(
+    page,
+    rect,
+    text,
+    fontsize,
+    align=fitz.TEXT_ALIGN_LEFT,
+    color=(0, 0, 0),
+):
+    """
+    Insert text using a Unicode font when available.
+
+    This is the main fix for characters like:
+    - „
+    - “
+    - ”
+    - ²
+    - ₂
+    - ⁻
+    becoming '?' in normal PDF output.
+    """
+    text = sanitize_text(text)
+
+    if UNICODE_FONT_PATH:
+        return page.insert_textbox(
+            rect,
+            text,
+            fontsize=fontsize,
+            fontname=CUSTOM_FONT_NAME,
+            fontfile=UNICODE_FONT_PATH,
+            color=color,
+            align=align,
+        )
+
+    # Fallback. Built-in Helvetica may not support all Unicode glyphs.
+    return page.insert_textbox(
+        rect,
+        text,
+        fontsize=fontsize,
+        fontname="helv",
+        color=color,
+        align=align,
+    )
 
 
 def insert_textbox_autofit(
@@ -342,9 +578,10 @@ def insert_textbox_autofit(
     rect: fitz.Rect,
     text: str,
     max_font_size=11.0,
-    min_font_size=4.5
+    min_font_size=4.5,
 ):
     rect = fitz.Rect(rect)
+    text = sanitize_text(text)
 
     # Padding
     rect.x0 += 1
@@ -358,37 +595,61 @@ def insert_textbox_autofit(
     font_size = max_font_size
 
     while font_size >= min_font_size:
-        rc = page.insert_textbox(
-            rect,
-            text,
-            fontsize=font_size,
-            fontname="helv",
-            color=(0, 0, 0),
-            align=fitz.TEXT_ALIGN_LEFT
-        )
+        try:
+            rc = page_insert_textbox_unicode(
+                page,
+                rect,
+                text,
+                fontsize=font_size,
+            )
 
-        if rc >= 0:
-            return True
+            if rc >= 0:
+                return True
+
+        except Exception as exc:
+            st.session_state["debug_log"].append(
+                f"Unicode PDF text insert failed: {str(exc)}"
+            )
+
+            try:
+                rc = page.insert_textbox(
+                    rect,
+                    text,
+                    fontsize=font_size,
+                    fontname="helv",
+                    color=(0, 0, 0),
+                    align=fitz.TEXT_ALIGN_LEFT,
+                )
+
+                if rc >= 0:
+                    return True
+
+            except Exception as fallback_exc:
+                st.session_state["debug_log"].append(
+                    f"Fallback PDF text insert failed: {str(fallback_exc)}"
+                )
 
         font_size -= 0.5
 
-    # Fallback: truncate.
+    # Fallback: truncate text.
     shortened = text
 
     while len(shortened) > 30:
         shortened = shortened[: int(len(shortened) * 0.9)].rstrip() + "..."
 
-        rc = page.insert_textbox(
-            rect,
-            shortened,
-            fontsize=min_font_size,
-            fontname="helv",
-            color=(0, 0, 0),
-            align=fitz.TEXT_ALIGN_LEFT
-        )
+        try:
+            rc = page_insert_textbox_unicode(
+                page,
+                rect,
+                shortened,
+                fontsize=min_font_size,
+            )
 
-        if rc >= 0:
-            return False
+            if rc >= 0:
+                return False
+
+        except Exception:
+            pass
 
     return False
 
@@ -406,7 +667,7 @@ def extract_pdf_text_blocks(page):
 
         for line in block["lines"]:
             spans = [
-                span.get("text", "")
+                sanitize_text(span.get("text", ""))
                 for span in line.get("spans", [])
                 if span.get("text", "").strip()
             ]
@@ -417,6 +678,7 @@ def extract_pdf_text_blocks(page):
                 lines.append(line_text)
 
         block_text = "\n".join(lines).strip()
+        block_text = sanitize_text(block_text)
 
         if not block_text:
             continue
@@ -444,7 +706,7 @@ def render_page_to_image(page, zoom=2.5):
     image = Image.frombytes(
         "RGB",
         [pix.width, pix.height],
-        pix.samples
+        pix.samples,
     )
 
     return image
@@ -462,16 +724,15 @@ def ocr_page_text(page, source_code: str, zoom=2.5) -> str:
         text = pytesseract.image_to_string(
             image,
             lang=tesseract_lang,
-            config="--psm 6"
+            config="--oem 1 --psm 6 -c preserve_interword_spaces=1",
         )
 
         return sanitize_text(text)
 
     except pytesseract.TesseractNotFoundError:
         raise RuntimeError(
-            "Tesseract OCR was not found. Install Tesseract on your system, "
-            "then restart the app. On Windows, you may need to set "
-            "pytesseract.pytesseract.tesseract_cmd."
+            "Tesseract OCR was not found on the Streamlit server. "
+            "Add tesseract-ocr to packages.txt and redeploy."
         )
 
     except Exception as exc:
@@ -484,7 +745,6 @@ def ocr_page_text(page, source_code: str, zoom=2.5) -> str:
 def split_text_for_pdf_pages(text: str, max_chars: int = 2600) -> list[str]:
     """
     Split translated OCR text into page-sized chunks.
-    This is approximate but prevents text from overflowing too badly.
     """
     text = sanitize_text(text)
 
@@ -535,7 +795,7 @@ def add_translated_ocr_pages(doc, translated_text: str, source_page_rect, title=
     for chunk_index, chunk in enumerate(page_chunks):
         new_page = doc.new_page(
             width=source_page_rect.width,
-            height=source_page_rect.height
+            height=source_page_rect.height,
         )
 
         margin = 50
@@ -544,14 +804,14 @@ def add_translated_ocr_pages(doc, translated_text: str, source_page_rect, title=
             margin,
             25,
             source_page_rect.width - margin,
-            50
+            55,
         )
 
         text_rect = fitz.Rect(
             margin,
-            60,
+            65,
             source_page_rect.width - margin,
-            source_page_rect.height - margin
+            source_page_rect.height - margin,
         )
 
         heading = title
@@ -559,13 +819,12 @@ def add_translated_ocr_pages(doc, translated_text: str, source_page_rect, title=
         if len(page_chunks) > 1:
             heading += f" — Part {chunk_index + 1}/{len(page_chunks)}"
 
-        new_page.insert_textbox(
+        insert_textbox_autofit(
+            new_page,
             title_rect,
             heading,
-            fontsize=12,
-            fontname="helv",
-            color=(0, 0, 0),
-            align=fitz.TEXT_ALIGN_LEFT
+            max_font_size=12,
+            min_font_size=8,
         )
 
         inserted = insert_textbox_autofit(
@@ -573,7 +832,7 @@ def add_translated_ocr_pages(doc, translated_text: str, source_page_rect, title=
             text_rect,
             chunk,
             max_font_size=11,
-            min_font_size=7
+            min_font_size=7,
         )
 
         if not inserted:
@@ -593,13 +852,13 @@ def overlay_translated_ocr_text(page, translated_text: str):
         margin,
         margin,
         page.rect.width - margin,
-        page.rect.height - margin
+        page.rect.height - margin,
     )
 
     page.draw_rect(
         rect,
         color=(1, 1, 1),
-        fill=(1, 1, 1)
+        fill=(1, 1, 1),
     )
 
     inserted = insert_textbox_autofit(
@@ -607,7 +866,7 @@ def overlay_translated_ocr_text(page, translated_text: str):
         rect,
         translated_text,
         max_font_size=10.5,
-        min_font_size=5
+        min_font_size=5,
     )
 
     if not inserted:
@@ -626,7 +885,7 @@ def translate_pdf(
     progress_callback=None,
     enable_ocr=False,
     ocr_output_mode="Append translated OCR pages",
-    ocr_zoom_value=2.5
+    ocr_zoom_value=2.5,
 ):
     translator = GoogleTranslator(source=source, target=target)
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -647,7 +906,7 @@ def translate_pdf(
                     translator,
                     source,
                     target,
-                    f"Page {page_index + 1}, Block {block_index + 1}"
+                    f"PDF Page {page_index + 1}, Block {block_index + 1}",
                 )
 
                 translated_blocks.append((rect, translated_text))
@@ -659,7 +918,7 @@ def translate_pdf(
             if translated_blocks:
                 page.apply_redactions(images=0)
 
-            # Insert translated text.
+            # Insert translated text using Unicode font.
             for rect, translated_text in translated_blocks:
                 if not insert_textbox_autofit(page, rect, translated_text):
                     st.session_state["debug_log"].append(
@@ -676,7 +935,7 @@ def translate_pdf(
                 ocr_text = ocr_page_text(
                     page,
                     source,
-                    zoom=ocr_zoom_value
+                    zoom=ocr_zoom_value,
                 )
 
                 if not ocr_text:
@@ -690,7 +949,7 @@ def translate_pdf(
                         translator,
                         source,
                         target,
-                        f"OCR Page {page_index + 1}"
+                        f"OCR Page {page_index + 1}",
                     )
 
                     if ocr_output_mode == "Append translated OCR pages":
@@ -698,13 +957,13 @@ def translate_pdf(
                             doc,
                             translated_ocr_text,
                             page.rect,
-                            title=f"Translated OCR text from page {page_index + 1}"
+                            title=f"Translated OCR text from page {page_index + 1}",
                         )
 
                     else:
                         overlay_translated_ocr_text(
                             page,
-                            translated_ocr_text
+                            translated_ocr_text,
                         )
 
             else:
@@ -720,7 +979,7 @@ def translate_pdf(
     doc.save(
         output,
         garbage=4,
-        deflate=True
+        deflate=True,
     )
 
     doc.close()
@@ -786,7 +1045,7 @@ def translate_docx(file_bytes, source, target, progress_callback=None):
             translator,
             source,
             target,
-            f"DOCX Paragraph {index + 1}"
+            f"DOCX Paragraph {index + 1}",
         )
 
         replace_paragraph_text(paragraph, translated_text)
@@ -822,7 +1081,7 @@ def translate_xlsx(file_bytes, source, target, progress_callback=None):
             translator,
             source,
             target,
-            f"XLSX Cell {cell.coordinate}"
+            f"XLSX Cell {cell.coordinate}",
         )
 
         cell.value = translated_text
@@ -840,7 +1099,7 @@ def get_mime_type(ext: str) -> str:
     return {
         "pdf": "application/pdf",
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }.get(ext, "application/octet-stream")
 
 
@@ -850,7 +1109,7 @@ def get_mime_type(ext: str) -> str:
 mode = st.radio(
     "Select Mode",
     ["Upload Files", "Plain Text"],
-    horizontal=True
+    horizontal=True,
 )
 
 if src_code == tgt_code and src_code != "auto":
@@ -863,7 +1122,7 @@ if mode == "Upload Files":
     uploaded_file = st.file_uploader(
         "Choose a file",
         type=["pdf", "docx", "xlsx"],
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
 
     if uploaded_file:
@@ -895,7 +1154,7 @@ if mode == "Upload Files":
                         progress_callback=update_progress,
                         enable_ocr=enable_ocr,
                         ocr_output_mode=ocr_output_mode,
-                        ocr_zoom_value=ocr_zoom
+                        ocr_zoom_value=ocr_zoom,
                     )
 
                 elif extension == "docx":
@@ -903,7 +1162,7 @@ if mode == "Upload Files":
                         file_bytes,
                         src_code,
                         tgt_code,
-                        update_progress
+                        update_progress,
                     )
 
                 elif extension == "xlsx":
@@ -911,7 +1170,7 @@ if mode == "Upload Files":
                         file_bytes,
                         src_code,
                         tgt_code,
-                        update_progress
+                        update_progress,
                     )
 
                 else:
@@ -962,13 +1221,13 @@ elif mode == "Plain Text":
             "Paste text here",
             height=400,
             placeholder="Type or paste...",
-            label_visibility="collapsed"
+            label_visibility="collapsed",
         )
 
         translate_button = st.button(
             "Translate Text",
             type="primary",
-            use_container_width=True
+            use_container_width=True,
         )
 
     with col2:
@@ -989,7 +1248,7 @@ elif mode == "Plain Text":
                         translator,
                         src_code,
                         tgt_code,
-                        "Plain Text"
+                        "Plain Text",
                     )
 
                 except Exception as exc:
@@ -1000,7 +1259,7 @@ elif mode == "Plain Text":
                 "Output",
                 value=st.session_state["translated_text_result"],
                 height=400,
-                label_visibility="collapsed"
+                label_visibility="collapsed",
             )
 
             st.download_button(
@@ -1008,7 +1267,7 @@ elif mode == "Plain Text":
                 data=st.session_state["translated_text_result"],
                 file_name="translated.txt",
                 mime="text/plain",
-                use_container_width=True
+                use_container_width=True,
             )
 
         else:
